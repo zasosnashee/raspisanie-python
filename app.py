@@ -1,4 +1,3 @@
-import os
 import asyncio
 from flask import Flask, render_template_string
 from datetime import datetime, timedelta
@@ -7,8 +6,7 @@ import re
 
 app = Flask(__name__)
 
-async def get_schedule_for_group():
-    """Парсит расписание для группы СЭЗ-24-2, подгруппа I"""
+async def get_schedule():
     browser = None
     try:
         browser = await launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
@@ -29,67 +27,69 @@ async def get_schedule_for_group():
         await page.waitForTimeout(1500)
         await page.click('.ui-menu-item')
         
-        # Ждём загрузки расписания (таблицы)
-        await page.waitForSelector('table', {'timeout': 10000})
-        await page.waitForTimeout(2000)
+        # Ждём загрузки расписания
+        await page.waitForTimeout(4000)
         
-        # Получаем HTML таблицы с расписанием
-        table_html = await page.evaluate('''
-            () => {
-                const tables = document.querySelectorAll('table');
-                if (tables.length > 0) {
-                    return tables[0].outerHTML;
-                }
-                return '';
-            }
-        ''')
+        # Получаем текст всей страницы
+        page_text = await page.evaluate('document.body.innerText')
         
-        # Парсим таблицу в список пар
+        # Разбиваем на строки
+        lines = page_text.split('\n')
+        
         schedule_by_date = {}
-        
-        # Разбиваем таблицу на строки
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL)
         current_date = None
         
-        for row in rows:
-            # Ищем дату в строке
-            date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', row)
+        for line in lines:
+            # Ищем дату
+            date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', line)
             if date_match:
                 current_date = date_match.group(1)
                 schedule_by_date[current_date] = []
                 continue
             
-            # Ищем ячейки таблицы
-            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
-            if len(cells) >= 4 and current_date:
-                teacher = re.sub(r'<[^>]+>', '', cells[0]).strip()
-                lesson_num = re.sub(r'<[^>]+>', '', cells[1]).strip()
-                subject_raw = re.sub(r'<[^>]+>', '', cells[2]).strip()
-                room = re.sub(r'<[^>]+>', '', cells[3]).strip()
+            # Если нашли строку с подгруппой I и есть текущая дата
+            if current_date is not None and ('(I)' in line or 'подгруппа I' in line):
+                # Ищем время в формате (8:30) или просто 8:30
+                time_match = re.search(r'\((\d{1,2}:\d{2})\)', line)
+                if not time_match:
+                    time_match = re.search(r'(\d{1,2}:\d{2})\s*[–-]', line)
                 
-                # Проверяем, что это наша подгруппа I
-                if '(I)' in subject_raw or '(I)' in teacher:
-                    # Очищаем название предмета от отметки подгруппы
-                    subject = re.sub(r'\s*\(I\)\s*', '', subject_raw)
-                    
-                    # Извлекаем время из номера урока
-                    time_match = re.search(r'\((\d{1,2}:\d{2})\)', lesson_num)
-                    if time_match:
-                        time = time_match.group(1)
-                    else:
-                        time = lesson_num
+                # Ищем предмет (до (I) или до цифр кабинета)
+                subject_match = re.search(r'([А-Яа-яёЁ]+(?:[\s\-][А-Яа-яёЁ]+)*)\s*\(I\)', line)
+                if not subject_match:
+                    subject_match = re.search(r'([А-Яа-яёЁ]+(?:[\s\-][А-Яа-яёЁ]+)*)\s*\d', line)
+                
+                # Ищем кабинет
+                room_match = re.search(r'\(I\)\s*(\d+[А-Яа-я]?)', line)
+                if not room_match:
+                    room_match = re.search(r'\s(\d{3})\s*$', line)
+                
+                if subject_match:
+                    subject = subject_match.group(1).strip()
+                    room = room_match.group(1) if room_match else ""
+                    time = time_match.group(1) if time_match else "—"
                     
                     schedule_by_date[current_date].append({
                         'time': time,
                         'subject': subject,
-                        'room': room,
-                        'teacher': teacher
+                        'room': room
                     })
+        
+        # Убираем дубликаты
+        for date in schedule_by_date:
+            unique = []
+            seen = set()
+            for p in schedule_by_date[date]:
+                key = (p['time'], p['subject'])
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(p)
+            schedule_by_date[date] = unique
         
         return schedule_by_date
         
     except Exception as e:
-        print(f"Ошибка парсинга: {e}")
+        print(f"Ошибка: {e}")
         return None
     finally:
         if browser:
@@ -104,23 +104,20 @@ def run_async(coro):
 def index():
     today = datetime.now()
     tomorrow = today + timedelta(days=1)
-    
     today_str = today.strftime("%d.%m.%Y")
     tomorrow_str = tomorrow.strftime("%d.%m.%Y")
     
-    # Получаем расписание
-    schedule_data = run_async(get_schedule_for_group())
+    schedule = run_async(get_schedule())
     
-    if schedule_data:
-        today_schedule = schedule_data.get(today_str, [])
-        tomorrow_schedule = schedule_data.get(tomorrow_str, [])
-        note = "✅ Данные с raspisanie.doyupk.ru (автообновление)"
+    if schedule:
+        today_pairs = schedule.get(today_str, [])
+        tomorrow_pairs = schedule.get(tomorrow_str, [])
+        note = "✅ Расписание загружено с сайта колледжа"
     else:
-        today_schedule = []
-        tomorrow_schedule = []
-        note = "⚠️ Не удалось загрузить расписание. Проверьте интернет или сайт колледжа."
+        today_pairs = []
+        tomorrow_pairs = []
+        note = "⚠️ Не удалось загрузить расписание. Попробуйте позже."
     
-    # HTML с дизайном (фиолетовый градиент, физика, адаптив)
     html = '''
     <!DOCTYPE html>
     <html lang="ru">
@@ -130,7 +127,6 @@ def index():
         <title>Расписание СЭЗ-24-2</title>
         <style>
             * { margin: 0; padding: 0; box-sizing: border-box; }
-            
             body {
                 font-family: 'Segoe UI', 'Inter', system-ui, sans-serif;
                 background: linear-gradient(135deg, #1a0b2e 0%, #2a1a4a 40%, #3a2a6a 100%);
@@ -141,153 +137,28 @@ def index():
                 color: #f0eaff;
                 overflow-y: auto;
             }
-            
             @keyframes breath {
                 0% { background-size: 100% 100%; background-position: 0% 0%; }
                 50% { background-size: 150% 150%; background-position: 100% 50%; }
                 100% { background-size: 100% 100%; background-position: 0% 0%; }
             }
-            
-            .container {
-                max-width: 750px;
-                margin: 0 auto;
-                display: flex;
-                flex-direction: column;
-                gap: 2rem;
-            }
-            
-            .header {
-                text-align: center;
-                margin-bottom: 0.5rem;
-            }
-            
-            .group {
-                font-size: 2rem;
-                font-weight: 800;
-                background: linear-gradient(135deg, #e0aaff, #c77dff, #9d4edd);
-                -webkit-background-clip: text;
-                background-clip: text;
-                color: transparent;
-                text-shadow: 0 2px 10px rgba(160, 100, 255, 0.3);
-            }
-            
-            .sub {
-                font-size: 0.9rem;
-                opacity: 0.8;
-                margin-top: 0.25rem;
-            }
-            
-            .note-banner {
-                background: rgba(255, 200, 100, 0.2);
-                border-left: 4px solid #ffaa44;
-                padding: 0.75rem;
-                border-radius: 1rem;
-                font-size: 0.8rem;
-                text-align: center;
-                margin-top: 0.5rem;
-            }
-            
-            .day-card {
-                background: rgba(25, 15, 45, 0.65);
-                backdrop-filter: blur(12px);
-                border-radius: 2rem;
-                padding: 1.5rem;
-                border: 1px solid rgba(200, 130, 255, 0.35);
-                box-shadow: 0 20px 35px -15px rgba(0,0,0,0.5);
-                transition: transform 0.2s ease;
-            }
-            
-            .day-title {
-                font-size: 1.6rem;
-                font-weight: 600;
-                margin-bottom: 0.25rem;
-                display: flex;
-                align-items: baseline;
-                flex-wrap: wrap;
-                gap: 0.75rem;
-            }
-            
-            .day-name {
-                background: linear-gradient(120deg, #d4a5ff, #b77eff);
-                -webkit-background-clip: text;
-                background-clip: text;
-                color: transparent;
-            }
-            
-            .date {
-                font-size: 0.9rem;
-                opacity: 0.7;
-                font-weight: normal;
-            }
-            
-            .pair-list {
-                margin-top: 1.2rem;
-                display: flex;
-                flex-direction: column;
-                gap: 0.8rem;
-            }
-            
-            .pair {
-                background: rgba(40, 28, 65, 0.8);
-                backdrop-filter: blur(4px);
-                border-radius: 1.5rem;
-                padding: 1rem 1.2rem;
-                display: flex;
-                align-items: center;
-                gap: 1rem;
-                flex-wrap: wrap;
-                border: 1px solid rgba(180, 110, 255, 0.5);
-                box-shadow: 0 6px 12px rgba(0,0,0,0.2);
-                transition: all 0.15s cubic-bezier(0.2, 1.2, 0.4, 1);
-                cursor: default;
-            }
-            
-            .pair:hover {
-                transform: translateY(-3px) scale(1.01);
-                background: rgba(70, 50, 100, 0.85);
-                border-color: rgba(200, 140, 255, 0.8);
-                box-shadow: 0 15px 25px -8px rgba(0,0,0,0.4);
-            }
-            
-            .time {
-                font-weight: 700;
-                background: #4a3780;
-                padding: 0.3rem 0.9rem;
-                border-radius: 2rem;
-                font-size: 0.85rem;
-                color: #e9d5ff;
-                min-width: 70px;
-                text-align: center;
-            }
-            
-            .subject {
-                font-size: 1.05rem;
-                font-weight: 500;
-                flex: 1;
-            }
-            
-            .room {
-                font-size: 0.8rem;
-                background: rgba(0,0,0,0.4);
-                padding: 0.2rem 0.8rem;
-                border-radius: 2rem;
-                color: #cdb5ff;
-            }
-            
-            .empty-message {
-                text-align: center;
-                padding: 2rem;
-                background: rgba(0,0,0,0.25);
-                border-radius: 1.5rem;
-                font-style: italic;
-            }
-            
-            footer {
-                text-align: center;
-                font-size: 0.7rem;
-                opacity: 0.5;
-                margin-top: 1rem;
-            }
+            .container { max-width: 750px; margin: 0 auto; display: flex; flex-direction: column; gap: 2rem; }
+            .header { text-align: center; margin-bottom: 0.5rem; }
+            .group { font-size: 2rem; font-weight: 800; background: linear-gradient(135deg, #e0aaff, #c77dff, #9d4edd); -webkit-background-clip: text; background-clip: text; color: transparent; text-shadow: 0 2px 10px rgba(160, 100, 255, 0.3); }
+            .sub { font-size: 0.9rem; opacity: 0.8; margin-top: 0.25rem; }
+            .note-banner { background: rgba(255, 200, 100, 0.2); border-left: 4px solid #ffaa44; padding: 0.75rem; border-radius: 1rem; font-size: 0.8rem; text-align: center; margin-top: 0.5rem; }
+            .day-card { background: rgba(25, 15, 45, 0.65); backdrop-filter: blur(12px); border-radius: 2rem; padding: 1.5rem; border: 1px solid rgba(200, 130, 255, 0.35); box-shadow: 0 20px 35px -15px rgba(0,0,0,0.5); transition: transform 0.2s ease; }
+            .day-title { font-size: 1.6rem; font-weight: 600; margin-bottom: 0.25rem; display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.75rem; }
+            .day-name { background: linear-gradient(120deg, #d4a5ff, #b77eff); -webkit-background-clip: text; background-clip: text; color: transparent; }
+            .date { font-size: 0.9rem; opacity: 0.7; font-weight: normal; }
+            .pair-list { margin-top: 1.2rem; display: flex; flex-direction: column; gap: 0.8rem; }
+            .pair { background: rgba(40, 28, 65, 0.8); backdrop-filter: blur(4px); border-radius: 1.5rem; padding: 1rem 1.2rem; display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; border: 1px solid rgba(180, 110, 255, 0.5); box-shadow: 0 6px 12px rgba(0,0,0,0.2); transition: all 0.15s cubic-bezier(0.2, 1.2, 0.4, 1); cursor: default; }
+            .pair:hover { transform: translateY(-3px) scale(1.01); background: rgba(70, 50, 100, 0.85); border-color: rgba(200, 140, 255, 0.8); box-shadow: 0 15px 25px -8px rgba(0,0,0,0.4); }
+            .time { font-weight: 700; background: #4a3780; padding: 0.3rem 0.9rem; border-radius: 2rem; font-size: 0.85rem; color: #e9d5ff; min-width: 70px; text-align: center; }
+            .subject { font-size: 1.05rem; font-weight: 500; flex: 1; }
+            .room { font-size: 0.8rem; background: rgba(0,0,0,0.4); padding: 0.2rem 0.8rem; border-radius: 2rem; color: #cdb5ff; }
+            .empty-message { text-align: center; padding: 2rem; background: rgba(0,0,0,0.25); border-radius: 1.5rem; font-style: italic; }
+            footer { text-align: center; font-size: 0.7rem; opacity: 0.5; margin-top: 1rem; }
         </style>
     </head>
     <body>
@@ -297,37 +168,21 @@ def index():
                 <div class="sub">подгруппа I</div>
                 <div class="note-banner">{{ note }}</div>
             </div>
-            
             <div class="day-card">
-                <div class="day-title">
-                    <span class="day-name">Сегодня</span>
-                    <span class="date">{{ today_date }}</span>
-                </div>
+                <div class="day-title"><span class="day-name">Сегодня</span><span class="date">{{ today_date }}</span></div>
                 <div class="pair-list">
-                    {% for pair in today_schedule %}
-                    <div class="pair">
-                        <div class="time">{{ pair.time }}</div>
-                        <div class="subject">{{ pair.subject }}</div>
-                        <div class="room">{{ pair.room }}</div>
-                    </div>
+                    {% for pair in today_pairs %}
+                    <div class="pair"><div class="time">{{ pair.time }}</div><div class="subject">{{ pair.subject }}</div><div class="room">{{ pair.room }}</div></div>
                     {% else %}
                     <div class="empty-message">📭 Пар на сегодня нет</div>
                     {% endfor %}
                 </div>
             </div>
-            
             <div class="day-card">
-                <div class="day-title">
-                    <span class="day-name">Завтра</span>
-                    <span class="date">{{ tomorrow_date }}</span>
-                </div>
+                <div class="day-title"><span class="day-name">Завтра</span><span class="date">{{ tomorrow_date }}</span></div>
                 <div class="pair-list">
-                    {% for pair in tomorrow_schedule %}
-                    <div class="pair">
-                        <div class="time">{{ pair.time }}</div>
-                        <div class="subject">{{ pair.subject }}</div>
-                        <div class="room">{{ pair.room }}</div>
-                    </div>
+                    {% for pair in tomorrow_pairs %}
+                    <div class="pair"><div class="time">{{ pair.time }}</div><div class="subject">{{ pair.subject }}</div><div class="room">{{ pair.room }}</div></div>
                     {% else %}
                     <div class="empty-message">📭 Пар на завтра нет</div>
                     {% endfor %}
@@ -340,8 +195,8 @@ def index():
     '''
     
     return render_template_string(html, 
-                                  today_schedule=today_schedule,
-                                  tomorrow_schedule=tomorrow_schedule,
+                                  today_pairs=today_pairs,
+                                  tomorrow_pairs=tomorrow_pairs,
                                   today_date=today_str,
                                   tomorrow_date=tomorrow_str,
                                   note=note)
