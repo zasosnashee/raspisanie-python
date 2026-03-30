@@ -1,34 +1,62 @@
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask, render_template_string
 from datetime import datetime, timedelta
 import re
 
 app = Flask(__name__)
 
-def get_schedule_for_date(date_str):
-    """
-    Парсит расписание для заданной даты (формат DD.MM.YYYY)
-    Возвращает список пар [{time, subject, room}]
-    """
-    # Здесь будет реальный парсинг после анализа сайта
-    # Пока возвращаем демо-данные
-    return [
-        {"time": "08:30-10:00", "subject": "Программирование", "room": "216"},
-        {"time": "10:15-11:45", "subject": "Базы данных", "room": "108"},
-        {"time": "12:00-13:30", "subject": "Физика", "room": "301"}
-    ]
+def parse_schedule_from_site():
+    """Парсит расписание с raspisanie.doyupk.ru для группы СЭЗ-24-2"""
+    try:
+        # Отправляем запрос к сайту
+        url = "https://raspisanie.doyupk.ru/"
+        response = requests.get(url, timeout=10)
+        response.encoding = 'utf-8'
+        html = response.text
+        
+        # Ищем расписание для нашей группы
+        # Обычно данные подгружаются через JavaScript, но попробуем найти в HTML
+        schedule_data = {}
+        
+        # Ищем блок с группой СЭЗ-24-2
+        group_pattern = r'СЭЗ-24-2.*?подгруппа\s*I'
+        
+        # Ищем пары по дням (простой regex для времени и предметов)
+        # Формат может быть разным, пробуем найти время вида "08:30-10:00"
+        time_pattern = r'(\d{2}:\d{2}\s*-\s*\d{2}:\d{2})'
+        
+        # Если находим время, ищем рядом предмет
+        times = re.findall(time_pattern, html)
+        
+        # Пока возвращаем тестовые данные, но с реальными временами
+        # Как только сайт загрузит расписание через JS, этот метод нужно будет дополнить
+        return None  # Возвращаем None, если парсинг не удался
+        
+    except Exception as e:
+        print(f"Ошибка парсинга: {e}")
+        return None
 
 @app.route('/')
 def index():
     today = datetime.now()
     tomorrow = today + timedelta(days=1)
     
-    today_str = today.strftime("%d.%m.%Y")
-    tomorrow_str = tomorrow.strftime("%d.%m.%Y")
+    # Пробуем получить реальное расписание
+    real_schedule = parse_schedule_from_site()
     
-    today_schedule = get_schedule_for_date(today_str)
-    tomorrow_schedule = get_schedule_for_date(tomorrow_str)
+    # Если парсинг не удался, показываем демо-расписание с пояснением
+    if real_schedule is None:
+        today_schedule = [
+            {"time": "🔄 08:30-10:00", "subject": "Парсинг настраивается", "room": ""},
+            {"time": "📱", "subject": "Сайт использует JavaScript", "room": ""},
+            {"time": "⚙️", "subject": "Нужно немного донастроить", "room": ""}
+        ]
+        tomorrow_schedule = today_schedule
+        note = "⚠️ Расписание временно тестовое. Нужна небольшая донастройка парсинга."
+    else:
+        today_schedule = real_schedule.get(today.strftime("%Y-%m-%d"), [])
+        tomorrow_schedule = real_schedule.get(tomorrow.strftime("%Y-%m-%d"), [])
+        note = "✅ Данные с raspisanie.doyupk.ru"
     
     html = '''
     <!DOCTYPE html>
@@ -84,6 +112,16 @@ def index():
                 font-size: 0.9rem;
                 opacity: 0.8;
                 margin-top: 0.25rem;
+            }
+            
+            .note-banner {
+                background: rgba(255, 200, 100, 0.2);
+                border-left: 4px solid #ffaa44;
+                padding: 0.75rem;
+                border-radius: 1rem;
+                font-size: 0.8rem;
+                text-align: center;
+                margin-top: 0.5rem;
             }
             
             .day-card {
@@ -193,7 +231,8 @@ def index():
         <div class="container">
             <div class="header">
                 <div class="group">СЭЗ-24-2</div>
-                <div class="sub">подгруппа I • данные с raspisanie.doyupk.ru</div>
+                <div class="sub">подгруппа I</div>
+                <div class="note-banner">{{ note }}</div>
             </div>
             
             <div class="day-card">
@@ -202,17 +241,15 @@ def index():
                     <span class="date">{{ today_date }}</span>
                 </div>
                 <div class="pair-list">
-                    {% if today_schedule %}
-                        {% for pair in today_schedule %}
-                        <div class="pair">
-                            <div class="time">{{ pair.time }}</div>
-                            <div class="subject">{{ pair.subject }}</div>
-                            <div class="room">{{ pair.room }}</div>
-                        </div>
-                        {% endfor %}
+                    {% for pair in today_schedule %}
+                    <div class="pair">
+                        <div class="time">{{ pair.time }}</div>
+                        <div class="subject">{{ pair.subject }}</div>
+                        <div class="room">{{ pair.room }}</div>
+                    </div>
                     {% else %}
-                        <div class="empty-message">📭 Пар на сегодня нет</div>
-                    {% endif %}
+                    <div class="empty-message">📭 Пар на сегодня нет</div>
+                    {% endfor %}
                 </div>
             </div>
             
@@ -222,17 +259,15 @@ def index():
                     <span class="date">{{ tomorrow_date }}</span>
                 </div>
                 <div class="pair-list">
-                    {% if tomorrow_schedule %}
-                        {% for pair in tomorrow_schedule %}
-                        <div class="pair">
-                            <div class="time">{{ pair.time }}</div>
-                            <div class="subject">{{ pair.subject }}</div>
-                            <div class="room">{{ pair.room }}</div>
-                        </div>
-                        {% endfor %}
+                    {% for pair in tomorrow_schedule %}
+                    <div class="pair">
+                        <div class="time">{{ pair.time }}</div>
+                        <div class="subject">{{ pair.subject }}</div>
+                        <div class="room">{{ pair.room }}</div>
+                    </div>
                     {% else %}
-                        <div class="empty-message">📭 Пар на завтра нет</div>
-                    {% endif %}
+                    <div class="empty-message">📭 Пар на завтра нет</div>
+                    {% endfor %}
                 </div>
             </div>
             <footer>обновляется автоматически • с физикой</footer>
@@ -245,7 +280,8 @@ def index():
                                   today_schedule=today_schedule,
                                   tomorrow_schedule=tomorrow_schedule,
                                   today_date=today.strftime("%d.%m.%Y"),
-                                  tomorrow_date=tomorrow.strftime("%d.%m.%Y"))
+                                  tomorrow_date=tomorrow.strftime("%d.%m.%Y"),
+                                  note=note)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
