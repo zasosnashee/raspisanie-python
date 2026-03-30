@@ -3,50 +3,90 @@ import asyncio
 from flask import Flask, render_template_string
 from datetime import datetime, timedelta
 from pyppeteer import launch
+import re
 
 app = Flask(__name__)
 
-async def get_schedule_from_site():
-    """Парсит расписание с raspisanie.doyupk.ru для группы СЭЗ-24-2"""
+async def get_schedule_for_group():
+    """Парсит расписание для группы СЭЗ-24-2, подгруппа I"""
     browser = None
     try:
         browser = await launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
         page = await browser.newPage()
         
         # Заходим на сайт
-        await page.goto('https://raspisanie.doyupk.ru/', {'waitUntil': 'networkidle2'})
+        await page.goto('https://raspisanie.doyupk.ru/', {'waitUntil': 'networkidle2', 'timeout': 30000})
         
         # Выбираем поиск по группе
-        await page.waitForSelector('input[value="group"]')
+        await page.waitForSelector('input[value="group"]', {'timeout': 5000})
         await page.click('input[value="group"]')
         
         # Вводим название группы
-        await page.waitForSelector('input[placeholder="Поиск группы"]')
+        await page.waitForSelector('input[placeholder="Поиск группы"]', {'timeout': 5000})
         await page.type('input[placeholder="Поиск группы"]', 'СЭЗ-24-2')
         
         # Ждём появления выпадающего списка и выбираем
-        await page.waitForTimeout(2000)
+        await page.waitForTimeout(1500)
         await page.click('.ui-menu-item')
         
-        # Ждём загрузки расписания
-        await page.waitForTimeout(3000)
+        # Ждём загрузки расписания (таблицы)
+        await page.waitForSelector('table', {'timeout': 10000})
+        await page.waitForTimeout(2000)
         
-        # Получаем текст всей страницы (так проще, если расписание как текст)
-        page_text = await page.evaluate('document.body.innerText')
+        # Получаем HTML таблицы с расписанием
+        table_html = await page.evaluate('''
+            () => {
+                const tables = document.querySelectorAll('table');
+                if (tables.length > 0) {
+                    return tables[0].outerHTML;
+                }
+                return '';
+            }
+        ''')
         
-        # Ищем расписание по дням
-        today = datetime.now()
-        tomorrow = today + timedelta(days=1)
+        # Парсим таблицу в список пар
+        schedule_by_date = {}
         
-        days_text = page_text.split('\n')
+        # Разбиваем таблицу на строки
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL)
+        current_date = None
         
-        # Простой парсинг текста
-        schedule = {today.strftime('%Y-%m-%d'): [], tomorrow.strftime('%Y-%m-%d'): []}
+        for row in rows:
+            # Ищем дату в строке
+            date_match = re.search(r'(\d{2}\.\d{2}\.\d{4})', row)
+            if date_match:
+                current_date = date_match.group(1)
+                schedule_by_date[current_date] = []
+                continue
+            
+            # Ищем ячейки таблицы
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+            if len(cells) >= 4 and current_date:
+                teacher = re.sub(r'<[^>]+>', '', cells[0]).strip()
+                lesson_num = re.sub(r'<[^>]+>', '', cells[1]).strip()
+                subject_raw = re.sub(r'<[^>]+>', '', cells[2]).strip()
+                room = re.sub(r'<[^>]+>', '', cells[3]).strip()
+                
+                # Проверяем, что это наша подгруппа I
+                if '(I)' in subject_raw or '(I)' in teacher:
+                    # Очищаем название предмета от отметки подгруппы
+                    subject = re.sub(r'\s*\(I\)\s*', '', subject_raw)
+                    
+                    # Извлекаем время из номера урока
+                    time_match = re.search(r'\((\d{1,2}:\d{2})\)', lesson_num)
+                    if time_match:
+                        time = time_match.group(1)
+                    else:
+                        time = lesson_num
+                    
+                    schedule_by_date[current_date].append({
+                        'time': time,
+                        'subject': subject,
+                        'room': room,
+                        'teacher': teacher
+                    })
         
-        # Здесь можно добавить логику поиска пар по дням
-        # Пока вернём пример, чтобы структура работала
-        
-        return schedule
+        return schedule_by_date
         
     except Exception as e:
         print(f"Ошибка парсинга: {e}")
@@ -56,7 +96,6 @@ async def get_schedule_from_site():
             await browser.close()
 
 def run_async(coro):
-    """Запускает асинхронную функцию в синхронном окружении Flask"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     return loop.run_until_complete(coro)
@@ -66,19 +105,22 @@ def index():
     today = datetime.now()
     tomorrow = today + timedelta(days=1)
     
-    # Пробуем получить расписание
-    schedule_data = run_async(get_schedule_from_site())
+    today_str = today.strftime("%d.%m.%Y")
+    tomorrow_str = tomorrow.strftime("%d.%m.%Y")
     
-    if schedule_data is None:
-        # Если парсинг не удался — показываем сообщение
+    # Получаем расписание
+    schedule_data = run_async(get_schedule_for_group())
+    
+    if schedule_data:
+        today_schedule = schedule_data.get(today_str, [])
+        tomorrow_schedule = schedule_data.get(tomorrow_str, [])
+        note = "✅ Данные с raspisanie.doyupk.ru (автообновление)"
+    else:
         today_schedule = []
         tomorrow_schedule = []
-        note = "⚠️ Не удалось загрузить расписание. Сайт может быть временно недоступен."
-    else:
-        today_schedule = schedule_data.get(today.strftime('%Y-%m-%d'), [])
-        tomorrow_schedule = schedule_data.get(tomorrow.strftime('%Y-%m-%d'), [])
-        note = "✅ Данные с raspisanie.doyupk.ru (автообновление)"
+        note = "⚠️ Не удалось загрузить расписание. Проверьте интернет или сайт колледжа."
     
+    # HTML с дизайном (фиолетовый градиент, физика, адаптив)
     html = '''
     <!DOCTYPE html>
     <html lang="ru">
@@ -214,7 +256,7 @@ def index():
                 border-radius: 2rem;
                 font-size: 0.85rem;
                 color: #e9d5ff;
-                min-width: 95px;
+                min-width: 70px;
                 text-align: center;
             }
             
@@ -300,8 +342,8 @@ def index():
     return render_template_string(html, 
                                   today_schedule=today_schedule,
                                   tomorrow_schedule=tomorrow_schedule,
-                                  today_date=today.strftime("%d.%m.%Y"),
-                                  tomorrow_date=tomorrow.strftime("%d.%m.%Y"),
+                                  today_date=today_str,
+                                  tomorrow_date=tomorrow_str,
                                   note=note)
 
 if __name__ == '__main__':
